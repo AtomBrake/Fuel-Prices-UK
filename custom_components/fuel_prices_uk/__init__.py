@@ -222,12 +222,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     entry.async_on_unload(entry.add_update_listener(update_listener))
 
     # Perform first refresh in the background so setup is not blocked by slow API paging.
-    # Stagger startup refreshes across config entries to avoid hammering the API
-    # with simultaneous requests when multiple locations are configured.
-    domain_data.setdefault("_entry_counter", 0)
-    domain_data["_entry_counter"] += 1
-    stagger_delay = (domain_data["_entry_counter"] - 1) * 15  # 15s between each entry
-    coordinator.start_startup_refresh(delay_seconds=stagger_delay)
+    # No per-entry stagger is needed: entries sharing credentials share one client
+    # (the second waits on its lock and reuses the fetch), and the module-level
+    # request lock already serialises every request to the API.
+    coordinator.start_startup_refresh()
 
     _LOGGER.info("Successfully set up Fuel Prices UK integration")
     return True
@@ -281,6 +279,8 @@ class FuelPricesDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]
             if entry_config.get(CONF_LOCATION_METHOD) == "device_tracker"
             else None
         )
+        # Last coordinates the tracker reported, used while it has none (e.g. unavailable).
+        self._last_tracker_location: tuple[float, float] | None = None
 
         _LOGGER.info(
             "[coordinator][__init__] Initialising with location=%s, radius=%s km, fuel_types=%s, update_interval=%s",
@@ -299,13 +299,13 @@ class FuelPricesDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]
             always_update=False,  # Only update if data changes to avoid unnecessary state writes
         )
 
-    def start_startup_refresh(self, delay_seconds: int = 0) -> None:
+    def start_startup_refresh(self) -> None:
         """Kick off one startup refresh without blocking config entry setup."""
         if self._startup_refresh_task and not self._startup_refresh_task.done():
             return
 
         self._startup_refresh_task = self.hass.async_create_task(
-            self._async_run_startup_refresh(delay_seconds=delay_seconds),
+            self._async_run_startup_refresh(),
             name=f"{DOMAIN}_{self.entry.entry_id}_startup_refresh",
         )
 
@@ -314,19 +314,8 @@ class FuelPricesDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]
         if self._startup_refresh_task and not self._startup_refresh_task.done():
             self._startup_refresh_task.cancel()
 
-    async def _async_run_startup_refresh(self, delay_seconds: int = 0) -> None:
+    async def _async_run_startup_refresh(self) -> None:
         """Run first refresh in background so entities can appear immediately."""
-        if delay_seconds > 0:
-            _LOGGER.info(
-                "[coordinator][startup_refresh] Staggering startup by %ds to reduce API load",
-                delay_seconds,
-            )
-            try:
-                await asyncio.sleep(delay_seconds)
-            except asyncio.CancelledError:
-                _LOGGER.debug("[coordinator][startup_refresh] Stagger delay cancelled")
-                raise
-
         _LOGGER.info("[coordinator][startup_refresh] Starting background initial refresh")
         try:
             initial_success = await self._async_run_startup_refresh_attempt("initial")
@@ -378,38 +367,49 @@ class FuelPricesDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]
 
         # Issue #10: override with live device_tracker coordinates if configured
         if self.device_tracker_entity_id:
-            tracker_state = self.hass.states.get(self.device_tracker_entity_id)
-            if tracker_state and tracker_state.state not in ("unavailable", "unknown", "not_home"):
-                try:
-                    tracker_lat = tracker_state.attributes.get("latitude")
-                    tracker_lon = tracker_state.attributes.get("longitude")
-                    if tracker_lat is not None and tracker_lon is not None:
-                        latitude = float(tracker_lat)
-                        longitude = float(tracker_lon)
-                        _LOGGER.debug(
-                            "[coordinator][_async_update_data] Using device_tracker %s location: lat=%s, lon=%s",
-                            self.device_tracker_entity_id,
-                            latitude,
-                            longitude,
-                        )
-                    else:
-                        _LOGGER.warning(
-                            "[coordinator][_async_update_data] device_tracker %s has no latitude/longitude attributes",
-                            self.device_tracker_entity_id,
-                        )
-                except (TypeError, ValueError):
-                    _LOGGER.warning(
-                        "[coordinator][_async_update_data] Could not parse coordinates from device_tracker %s",
-                        self.device_tracker_entity_id,
-                    )
-            else:
+            tracker_location = self._read_tracker_location()
+            if tracker_location is not None:
+                self._last_tracker_location = tracker_location
+                latitude, longitude = tracker_location
                 _LOGGER.debug(
-                    "[coordinator][_async_update_data] device_tracker %s state is %s; using last known location",
+                    "[coordinator][_async_update_data] Using device_tracker %s location: lat=%s, lon=%s",
                     self.device_tracker_entity_id,
-                    tracker_state.state if tracker_state else "<not found>",
+                    latitude,
+                    longitude,
+                )
+            elif self._last_tracker_location is not None:
+                latitude, longitude = self._last_tracker_location
+                _LOGGER.debug(
+                    "[coordinator][_async_update_data] device_tracker %s has no usable location; "
+                    "using last known location",
+                    self.device_tracker_entity_id,
+                )
+            else:
+                _LOGGER.warning(
+                    "[coordinator][_async_update_data] device_tracker %s has no usable location yet",
+                    self.device_tracker_entity_id,
                 )
 
         return latitude, longitude
+
+    def _read_tracker_location(self) -> tuple[float, float] | None:
+        """Return the tracker's current coordinates, or None if it has none usable.
+
+        Any state counts, including "not_home": a GPS tracker away from every
+        zone still reports its latitude/longitude, and that is exactly when
+        searching around the tracker matters most.
+        """
+        tracker_state = self.hass.states.get(self.device_tracker_entity_id)
+        if tracker_state is None or tracker_state.state in ("unavailable", "unknown"):
+            return None
+        try:
+            tracker_lat = tracker_state.attributes.get("latitude")
+            tracker_lon = tracker_state.attributes.get("longitude")
+            if tracker_lat is None or tracker_lon is None:
+                return None
+            return float(tracker_lat), float(tracker_lon)
+        except (TypeError, ValueError):
+            return None
 
     async def _async_update_data(self) -> list[dict[str, Any]]:
         """Fetch data from fuel price sources."""

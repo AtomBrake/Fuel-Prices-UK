@@ -461,3 +461,148 @@ class TestRateLimitAndAuth:
             m.post(TOKEN_URL, status=401, payload={"message": "invalid client"})
             with pytest.raises(RuntimeError):
                 await wrong.async_validate_credentials()
+
+
+def _incremental_starts(m: aiointercept) -> list[str]:
+    return [
+        request.query["effective-start-timestamp"]
+        for (method, _url), request in m.ordered_requests
+        if method == "GET" and "effective-start-timestamp" in request.query
+    ]
+
+
+class TestRefreshWindowsAndResync:
+    async def test_incremental_window_overlaps_previous_fetch(self, fast_client, aiohttp_client_session) -> None:
+        """The next window must start before the previous fetch began, not when it ended.
+
+        Otherwise a price published while a multi-minute fetch was paging can
+        land on an already-fetched batch and fall outside the next window.
+        """
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c20", client_secret="s20")
+        overlap = timedelta(seconds=fast_client.INCREMENTAL_OVERLAP_SECONDS)
+        before_fetch = datetime.now(UTC)
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(PFS_INFO_PATTERN, status=200, payload={"total_batches": 1, "data": [_station_info_row("s1")]})
+            m.get(PFS_PRICES_PATTERN, status=200, payload={"total_batches": 1, "data": [_price_row("s1", 145.9)]})
+            await api._refresh()
+        after_fetch = datetime.now(UTC)
+
+        # Anchored to when the fetch started (minus the overlap), not when it finished.
+        assert api._updates_since is not None
+        assert before_fetch - overlap <= api._updates_since <= after_fetch - overlap
+        assert api._updates_since < api._last_refresh - overlap
+
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(PFS_INFO_PATTERN, status=404, payload={"message": "Requested batch 1 is not available"})
+            m.get(PFS_PRICES_PATTERN, status=404, payload={"message": "Requested batch 1 is not available"})
+            expected_start = api._updates_since.strftime("%Y-%m-%d %H:%M:%S")
+            await api._refresh()
+
+            assert _incremental_starts(m) == [expected_start, expected_start]
+
+    async def test_daily_full_resync_drops_closed_stations(self, fast_client, aiohttp_client_session) -> None:
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c21", client_secret="s21")
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(
+                PFS_INFO_PATTERN,
+                status=200,
+                payload={"total_batches": 1, "data": [_station_info_row("open"), _station_info_row("closed")]},
+            )
+            m.get(
+                PFS_PRICES_PATTERN,
+                status=200,
+                payload={"total_batches": 1, "data": [_price_row("open", 145.9), _price_row("closed", 120.9)]},
+            )
+            await api._refresh()
+        assert set(api._station_index) == {"open", "closed"}
+
+        # A day later the closed station is simply absent from the snapshot.
+        api._last_full_refresh -= timedelta(seconds=fast_client.FULL_RESYNC_SECONDS + 1)
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(PFS_INFO_PATTERN, status=200, payload={"total_batches": 1, "data": [_station_info_row("open")]})
+            m.get(PFS_PRICES_PATTERN, status=200, payload={"total_batches": 1, "data": [_price_row("open", 145.9)]})
+            await api._refresh()
+
+            assert _incremental_starts(m) == []
+
+        assert set(api._station_index) == {"open"}
+
+    async def test_failed_resync_keeps_existing_cache(self, fast_client, aiohttp_client_session) -> None:
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c22", client_secret="s22")
+        async with _mock_api() as m:
+            await _full_snapshot_refresh(api, m)
+        api._last_full_refresh -= timedelta(seconds=fast_client.FULL_RESYNC_SECONDS + 1)
+
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(PFS_INFO_PATTERN, status=500, payload={"message": "Internal Server Error"})
+            with pytest.raises(ApiHttpError):
+                await api._refresh()
+
+        assert api._station_index["s1"]["prices"]["E10"]["price"] == pytest.approx(1.459)
+
+
+class TestPriceSanity:
+    async def test_implausible_prices_are_not_stored(self, fast_client, aiohttp_client_session) -> None:
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c23", client_secret="s23")
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(
+                PFS_INFO_PATTERN,
+                status=200,
+                payload={"total_batches": 1, "data": [_station_info_row("zero"), _station_info_row("ok")]},
+            )
+            m.get(
+                PFS_PRICES_PATTERN,
+                status=200,
+                payload={"total_batches": 1, "data": [_price_row("zero", 0), _price_row("ok", 145.9)]},
+            )
+            await api._refresh()
+
+        assert "E10" not in api._station_index["zero"]["prices"]
+        assert api._station_index["ok"]["prices"]["E10"]["price"] == pytest.approx(1.459)
+
+    async def test_junk_update_keeps_previous_price(self, fast_client, aiohttp_client_session) -> None:
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c24", client_secret="s24")
+        async with _mock_api() as m:
+            await _full_snapshot_refresh(api, m, station_price=145.9)
+
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(PFS_INFO_PATTERN, status=404, payload={"message": "Requested batch 1 is not available"})
+            # 5.999 GBP/L once scaled from pence - a feed error, not a price.
+            m.get(PFS_PRICES_PATTERN, status=200, payload={"total_batches": 1, "data": [_price_row("s1", 599.9)]})
+            await api._refresh()
+
+        assert api._station_index["s1"]["prices"]["E10"]["price"] == pytest.approx(1.459)
+
+
+class TestReturnedDataIsNotMutated:
+    async def test_incremental_update_does_not_change_previously_returned_stations(
+        self, fast_client, aiohttp_client_session
+    ) -> None:
+        """Data handed to the coordinator must not change under it.
+
+        The coordinator compares previous and new data to decide whether to
+        notify sensors; if the merge edited the old snapshot's price dicts in
+        place, the two would compare equal and the update could be dropped.
+        """
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c25", client_secret="s25")
+        async with _mock_api() as m:
+            await _full_snapshot_refresh(api, m, station_price=145.9)
+        previous = await api.get_stations_within_radius(51.5, -0.12, 5, max_age=3600)
+
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(PFS_INFO_PATTERN, status=404, payload={"message": "Requested batch 1 is not available"})
+            m.get(PFS_PRICES_PATTERN, status=200, payload={"total_batches": 1, "data": [_price_row("s1", 139.9)]})
+            await api._refresh()
+        current = await api.get_stations_within_radius(51.5, -0.12, 5, max_age=3600)
+
+        assert previous[0]["prices"]["E10"]["price"] == pytest.approx(1.459)
+        assert current[0]["prices"]["E10"]["price"] == pytest.approx(1.399)
+        assert previous != current

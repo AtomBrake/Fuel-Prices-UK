@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from custom_components.fuel_prices_uk.price_parser import coerce_price
+from custom_components.fuel_prices_uk.price_parser import coerce_price, is_plausible_price
 
 
 @pytest.mark.parametrize(
@@ -50,3 +50,20 @@ def test_coerce_price_valid(value, expected) -> None:
 )
 def test_coerce_price_unparseable_returns_none(value) -> None:
     assert coerce_price(value) is None
+
+
+@pytest.mark.parametrize(
+    ("price", "plausible"),
+    [
+        (1.459, True),
+        (0.5, True),
+        (3.5, True),
+        (5.0, True),
+        (0.0, False),
+        (0.49, False),
+        (5.01, False),
+        (49.9, False),  # parsed as pounds by coerce_price, but not a believable price
+    ],
+)
+def test_is_plausible_price(price, plausible) -> None:
+    assert is_plausible_price(price) is plausible

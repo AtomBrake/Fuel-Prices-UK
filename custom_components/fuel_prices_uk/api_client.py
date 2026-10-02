@@ -15,7 +15,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .price_parser import coerce_price
+from .price_parser import coerce_price, is_plausible_price
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +48,14 @@ DATE_FORMATS = (
 )
 
 CACHE_SECONDS = 3600
+# Incremental windows start this long before the previous fetch began, so a
+# price published while that (possibly multi-minute) fetch was paging can't
+# fall between two windows. Re-merging an unchanged record is harmless.
+INCREMENTAL_OVERLAP_SECONDS = 300
+# Incremental updates never report removed stations, so periodically replace
+# the whole cache with a full snapshot; otherwise a closed station keeps its
+# last price (possibly the "cheapest") until Home Assistant restarts.
+FULL_RESYNC_SECONDS = 24 * 3600
 MAX_BATCHES = 80
 MIN_REQUEST_INTERVAL_SECONDS = 2.05
 DEFAULT_TIMEOUT_SECONDS = 20
@@ -136,6 +144,8 @@ class FuelPricesAPI:
         self._stations: list[StationRecord] = []
         self._station_index: dict[str, dict[str, Any]] = {}
         self._last_refresh: datetime | None = None
+        self._last_full_refresh: datetime | None = None
+        self._updates_since: datetime | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -268,13 +278,19 @@ class FuelPricesAPI:
         return age is not None and age < max_age
 
     async def _refresh(self) -> None:
-        is_incremental = bool(self._last_refresh and self._station_index)
+        refresh_started_at = datetime.now(UTC)
+        full_resync_due = (
+            self._last_full_refresh is None
+            or (refresh_started_at - self._last_full_refresh).total_seconds() >= FULL_RESYNC_SECONDS
+        )
+        is_incremental = bool(self._updates_since and self._station_index and not full_resync_due)
         # Fuel Finder's incremental endpoints expect "YYYY-MM-DD HH:MM:SS"
         # (matching the API docs' request example), not a bare date - a
         # date-only value is silently rejected with an undocumented 404
         # instead of the documented 400, forcing a full-snapshot fallback
         # on every refresh.
-        incremental_timestamp = self._last_refresh.strftime("%Y-%m-%d %H:%M:%S") if self._last_refresh else None
+        incremental_timestamp = self._updates_since.strftime("%Y-%m-%d %H:%M:%S") if self._updates_since else None
+        was_full_snapshot = not is_incremental
 
         try:
             if is_incremental and incremental_timestamp:
@@ -283,18 +299,14 @@ class FuelPricesAPI:
                 prices = await self._fetch_station_prices(effective_start=incremental_timestamp)
                 if not stations and not prices:
                     _LOGGER.debug("Fuel Finder incremental refresh reported no station or price updates")
-                    self._last_refresh = datetime.now(UTC)
+                    self._mark_refreshed(refresh_started_at, full_snapshot=False)
                     return
                 self._merge_station_info(stations)
                 self._merge_station_prices(prices)
             else:
-                stations = await self._fetch_station_info()
-                await self._inter_fetch_pause()
-                prices = await self._fetch_station_prices()
-                new_index: dict[str, dict[str, Any]] = {}
-                self._station_index = new_index
-                self._merge_station_info(stations)
-                self._merge_station_prices(prices)
+                if self._station_index:
+                    _LOGGER.debug("Fuel Finder daily full resync (drops stations that have closed)")
+                await self._replace_with_full_snapshot()
         except RuntimeError as err:
             if is_incremental and _is_transient_error(err):
                 # A 5xx/timeout/rate limit says nothing about our cached data,
@@ -310,12 +322,8 @@ class FuelPricesAPI:
                     "Fuel Finder incremental refresh failed (%s); retrying with full snapshot",
                     err,
                 )
-                stations = await self._fetch_station_info()
-                await self._inter_fetch_pause()
-                prices = await self._fetch_station_prices()
-                self._station_index = {}
-                self._merge_station_info(stations)
-                self._merge_station_prices(prices)
+                await self._replace_with_full_snapshot()
+                was_full_snapshot = True
             else:
                 raise
 
@@ -334,7 +342,22 @@ class FuelPricesAPI:
             raise RuntimeError("Fuel Finder response had no stations with usable coordinates")
 
         self._stations = station_records
+        self._mark_refreshed(refresh_started_at, full_snapshot=was_full_snapshot)
+
+    async def _replace_with_full_snapshot(self) -> None:
+        """Fetch every station and price, replacing the cache only once both succeed."""
+        stations = await self._fetch_station_info()
+        await self._inter_fetch_pause()
+        prices = await self._fetch_station_prices()
+        self._station_index = {}
+        self._merge_station_info(stations)
+        self._merge_station_prices(prices)
+
+    def _mark_refreshed(self, started_at: datetime, *, full_snapshot: bool) -> None:
         self._last_refresh = datetime.now(UTC)
+        self._updates_since = started_at - timedelta(seconds=INCREMENTAL_OVERLAP_SECONDS)
+        if full_snapshot:
+            self._last_full_refresh = started_at
 
     async def _fetch_station_info(self, *, effective_start: str | None = None) -> list[dict[str, Any]]:
         return await self._fetch_batched_resource(PFS_INFO_ENDPOINT, effective_start=effective_start)
@@ -744,7 +767,11 @@ class FuelPricesAPI:
                 }
 
             station_prices = station.get("prices")
-            prices: dict[str, Any] = station_prices if isinstance(station_prices, dict) else {}
+            # Build a new dict rather than mutating the cached one in place: the
+            # coordinator's previous data shares these dicts (stations are only
+            # shallow-copied), so in-place edits would make old and new data
+            # compare equal and could suppress the sensor update.
+            prices: dict[str, Any] = dict(station_prices) if isinstance(station_prices, dict) else {}
             last_updated = station.get("last_updated") if isinstance(station.get("last_updated"), str) else None
 
             for fuel_entry in _extract_fuel_entries_from_row(row):
@@ -758,6 +785,17 @@ class FuelPricesAPI:
 
                 parsed_price = _extract_fuel_entry_price(fuel_entry)
                 if parsed_price is None:
+                    continue
+                if not is_plausible_price(parsed_price):
+                    # A junk value (0, a typo, a mis-scaled unit) would otherwise
+                    # rank as the cheapest price and, with long-term statistics,
+                    # leave a permanent spike. Keep the previous price instead.
+                    _LOGGER.debug(
+                        "Ignoring implausible %s price %s for station %s",
+                        target_fuel_type,
+                        parsed_price,
+                        node_id,
+                    )
                     continue
 
                 price_last_updated = _parse_datetime(

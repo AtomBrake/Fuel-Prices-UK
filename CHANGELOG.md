@@ -27,6 +27,28 @@ All notable changes to this project are documented here. Format follows
   towards the stale-data Repair. An incremental refresh that fails this way
   no longer falls back to a full nationwide snapshot
   ([#14](https://github.com/beecho01/Fuel-Prices-UK/issues/14)).
+- Device-tracker locations now work away from home. A GPS tracker outside
+  every zone (state `not_home`) still reports coordinates, and these were
+  ignored, leaving every sensor unavailable. When the tracker has no usable
+  location (for example while it is unavailable), its last known location
+  is used.
+- Closed stations are now removed: the cache is fully resynced once a day,
+  because incremental updates never report removed stations. Previously a
+  closed station kept its last price, possibly as the "cheapest", until
+  Home Assistant restarted.
+- Implausible prices (outside GBP 0.50–5.00 per litre, for example a `0` in
+  the feed) are ignored instead of becoming the cheapest price, and the
+  station's previous price is kept.
+- Each incremental refresh window now starts 5 minutes before the previous
+  fetch began, not when it finished, so prices published while a fetch was
+  in progress are no longer missed.
+- Switching an entry from address to map or device tracker in the options
+  no longer leaves the old address in entity names.
+- Saving options no longer adds another 15 seconds to the next startup
+  refresh each time. The per-entry startup stagger has been removed:
+  entries now share one API client, and requests were already serialised.
+- Price updates no longer modify data the coordinator already holds, which
+  could make it decide nothing had changed and skip updating the sensors.
 
 ### Changed
 

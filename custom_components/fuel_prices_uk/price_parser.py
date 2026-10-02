@@ -20,6 +20,17 @@ PRICE_KEYS_PRIMARY: tuple[str, ...] = (
 )
 
 
+# Bounds (GBP per litre) for a price to be believable. UK pump prices have sat
+# well inside this range; anything outside it is a feed error, not a bargain.
+MIN_PLAUSIBLE_PRICE = 0.50
+MAX_PLAUSIBLE_PRICE = 5.00
+
+
+def is_plausible_price(price: float) -> bool:
+    """Return True if a GBP-per-litre price is within the believable range."""
+    return MIN_PLAUSIBLE_PRICE <= price <= MAX_PLAUSIBLE_PRICE
+
+
 def _iter_candidates(entry: Any) -> Iterable[Any]:
     if isinstance(entry, dict):
         for key in PRICE_KEYS_PRIMARY:
