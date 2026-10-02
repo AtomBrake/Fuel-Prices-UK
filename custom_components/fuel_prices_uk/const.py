@@ -46,6 +46,16 @@ DEFAULT_MAX_DATA_AGE_DAYS = 0  # 0 = no limit
 # raised (Settings -> Repairs) so stale data doesn't fail silently.
 CONSECUTIVE_FAILURE_THRESHOLD = 3
 
+# How far ahead of each poll the shared station cache is treated as stale.
+# HA schedules polls with sub-second jitter, so a cache lifetime equal to the
+# poll interval would often still look "fresh" when the next poll fires and
+# silently skip that cycle's fetch.
+CACHE_REFRESH_MARGIN_SECONDS = 60
+
+# When a refresh fails, keep serving cached prices up to this old rather than
+# making every sensor unavailable over a transient upstream error.
+CACHED_DATA_GRACE_SECONDS = 6 * 3600
+
 # Supported fuel types based on UK government data
 FUEL_TYPE_E10 = "E10"
 FUEL_TYPE_E5 = "E5"

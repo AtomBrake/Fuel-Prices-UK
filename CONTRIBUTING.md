@@ -12,7 +12,7 @@ pip install -r requirements_dev.txt
 
 `requirements_dev.txt` includes the Home Assistant/aiohttp/voluptuous
 packages the integration's own modules import directly, plus the test-only
-tools (`pytest`, `pytest-asyncio`, `aioresponses`, `ruff`).
+tools (`pytest`, `pytest-asyncio`, `aiointercept`, `ruff`).
 
 ## Running the test suite
 
@@ -20,7 +20,7 @@ tools (`pytest`, `pytest-asyncio`, `aioresponses`, `ruff`).
 pytest tests/ -v
 ```
 
-The suite is pure-logic and mocked-API (via `aioresponses`) — no live
+The suite is pure-logic and mocked-API (via `aiointercept`) — no live
 credentials or network access required. It covers:
 
 - `price_parser.coerce_price` and the `location.py` pure helpers
