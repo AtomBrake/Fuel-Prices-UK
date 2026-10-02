@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions use the
 `YYYY.MM.DD` scheme HACS integrations conventionally use.
 
+## [Unreleased]
+
+### Changed
+
+- Price sensors now use `state_class: measurement`, so Home Assistant keeps
+  long-term statistics and price history survives the recorder purge
+  (10 days by default). The `monetary` device class has been removed because
+  Home Assistant does not allow it together with `measurement`. The `GBP`
+  unit is unchanged.
+
 ## [2026.08.23] - 2026-08-23
 
 ### Fixed

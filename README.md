@@ -277,7 +277,7 @@ Example: `sensor.fuel_price_uk_sw1a_2aa_3_mi_cheapest_e10`
 - `distance`: Distance from your location (km)
 - `last_updated`: When the price was last updated
 - `unit_of_measurement`: GBP
-- `device_class`: monetary
+- `state_class`: measurement (enables long-term statistics beyond the recorder's purge window)
 - `icon`: mdi:gas-station
 
 ## Example Lovelace Card
