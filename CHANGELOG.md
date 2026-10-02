@@ -59,8 +59,12 @@ All notable changes to this project are documented here. Format follows
   unit is unchanged.
 - Tests now mock the Fuel Finder API with `aiointercept` instead of
   `aioresponses`, which does not work with aiohttp 3.14 (the version current
-  Home Assistant uses). The CI test matrix moves from Python 3.12/3.13 to
-  3.13/3.14 to match the Python versions Home Assistant supports.
+  Home Assistant uses). CI now tests on Python 3.14 only, which current
+  Home Assistant requires; the newest Home Assistant installable on older
+  Pythons pins dependency versions aiointercept doesn't support.
+- `requests` is no longer listed in `manifest.json` requirements. Home
+  Assistant already ships it, and hassfest now rejects custom integrations
+  that list it.
 
 ## [2026.08.23] - 2026-08-23
 

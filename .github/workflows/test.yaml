@@ -10,10 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # 3.14 is what current Home Assistant runs on (HA >= 2026.3 requires it);
-        # 3.13 covers the last HA releases before that. 3.12 is dropped: the
-        # newest HA it can install pins aiohttp 3.11, below aiointercept's minimum.
-        python-version: ["3.13", "3.14"]
+        # Home Assistant has required Python 3.14 since 2026.3. Older Pythons
+        # can't be tested: the newest HA they can install pins yarl/aiohttp
+        # versions below aiointercept's minimum (HA 2026.2 on 3.13 pins
+        # yarl==1.22.0; aiointercept needs >= 1.23.0).
+        python-version: ["3.14"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
