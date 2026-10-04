@@ -15,7 +15,7 @@ from aiohttp import ClientError, ClientSession, ClientTimeout
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .price_parser import coerce_price
+from .price_parser import coerce_price, is_plausible_price
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +48,14 @@ DATE_FORMATS = (
 )
 
 CACHE_SECONDS = 3600
+# Incremental windows start this long before the previous fetch began, so a
+# price published while that (possibly multi-minute) fetch was paging can't
+# fall between two windows. Re-merging an unchanged record is harmless.
+INCREMENTAL_OVERLAP_SECONDS = 300
+# Incremental updates never report removed stations, so periodically replace
+# the whole cache with a full snapshot; otherwise a closed station keeps its
+# last price (possibly the "cheapest") until Home Assistant restarts.
+FULL_RESYNC_SECONDS = 24 * 3600
 MAX_BATCHES = 80
 MIN_REQUEST_INTERVAL_SECONDS = 2.05
 DEFAULT_TIMEOUT_SECONDS = 20
@@ -66,10 +74,13 @@ _global_429_cooldown_until: float = 0.0
 _global_request_lock = asyncio.Lock()
 _global_last_request_at: float | None = None
 
-# Shared token cache keyed by (client_id, base_url) so that config entries
-# sharing the same Fuel Finder credentials reuse one token instead of each
-# requesting their own, halving the number of token endpoint calls.
-_global_token_cache: dict[tuple[str, str], tuple[str, datetime]] = {}
+# Shared token cache keyed by (client_id, client_secret, base_url). Fuel Finder
+# issues one active token per client - requesting a new one invalidates the
+# previous one - so every instance must read the token from here rather than
+# keeping its own copy, otherwise two instances can keep invalidating each
+# other's tokens (issue #8). The secret is part of the key so a cached token
+# only ever vouches for the exact credentials that obtained it.
+_global_token_cache: dict[tuple[str, str, str], tuple[str, datetime]] = {}
 _global_token_lock = asyncio.Lock()
 
 
@@ -90,6 +101,22 @@ class ApiHttpError(RuntimeError):
         self.endpoint = endpoint
         self.status_code = status_code
         self.message = message
+
+
+class TransientApiError(RuntimeError):
+    """Raised for network errors, timeouts and exhausted 429 retries.
+
+    These say nothing about the data itself, so the right response is to try
+    again next cycle - not to throw away the cache or fall back to an
+    expensive full snapshot.
+    """
+
+
+def _is_transient_error(err: Exception) -> bool:
+    """Return True for failures likely to clear on their own (network, rate limit, 5xx)."""
+    if isinstance(err, TransientApiError):
+        return True
+    return isinstance(err, ApiHttpError) and err.status_code >= 500
 
 
 class FuelPricesAPI:
@@ -117,9 +144,16 @@ class FuelPricesAPI:
         self._stations: list[StationRecord] = []
         self._station_index: dict[str, dict[str, Any]] = {}
         self._last_refresh: datetime | None = None
+        self._last_full_refresh: datetime | None = None
+        self._updates_since: datetime | None = None
         self._lock = asyncio.Lock()
-        self._access_token: str | None = None
-        self._token_expiry: datetime | None = None
+
+    @property
+    def data_age_seconds(self) -> float | None:
+        """Seconds since the cached data was last refreshed, or None if never."""
+        if self._last_refresh is None:
+            return None
+        return (datetime.now(UTC) - self._last_refresh).total_seconds()
 
     async def get_all_stations(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
         """Return cached station dictionaries."""
@@ -141,10 +175,38 @@ class FuelPricesAPI:
         return None
 
     async def get_stations_within_radius(
-        self, latitude: float, longitude: float, radius_km: float
+        self,
+        latitude: float,
+        longitude: float,
+        radius_km: float,
+        *,
+        max_age: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Return stations within the provided radius."""
-        await self._ensure_data()
+        """Return stations within the provided radius.
+
+        ``max_age`` is how old (in seconds) the cached data may be before it is
+        refreshed; it defaults to the client's ``cache_seconds``. Callers on a
+        polling schedule should pass something just under their poll interval
+        so each poll actually fetches new data.
+        """
+        await self._ensure_data(max_age=max_age)
+        return self._stations_within_radius(latitude, longitude, radius_km)
+
+    def cached_stations_within_radius(
+        self, latitude: float, longitude: float, radius_km: float, *, max_age: float
+    ) -> list[dict[str, Any]] | None:
+        """Return stations within the radius from cache only, without any API call.
+
+        Returns None when there is no cached data or it is older than
+        ``max_age`` seconds. Used to keep serving recent prices when an
+        upstream refresh fails transiently.
+        """
+        age = self.data_age_seconds
+        if age is None or age > max_age or not self._stations:
+            return None
+        return self._stations_within_radius(latitude, longitude, radius_km)
+
+    def _stations_within_radius(self, latitude: float, longitude: float, radius_km: float) -> list[dict[str, Any]]:
         matches: list[tuple[float, dict[str, Any]]] = []
         for record in self._stations:
             distance = _distance_km(latitude, longitude, record.latitude, record.longitude)
@@ -175,8 +237,13 @@ class FuelPricesAPI:
         return results
 
     async def async_validate_credentials(self) -> bool:
-        """Validate OAuth credentials against Fuel Finder token endpoint."""
-        await self._get_access_token(force_refresh=True)
+        """Validate OAuth credentials against Fuel Finder token endpoint.
+
+        A still-valid cached token for these exact credentials already proves
+        they work, and reusing it avoids issuing a new token - which would
+        invalidate the one running config entries are using.
+        """
+        await self._get_access_token()
         return True
 
     def sort_by_fuel_price(self, stations: Iterable[dict[str, Any]], fuel_type: str) -> list[dict[str, Any]]:
@@ -194,29 +261,36 @@ class FuelPricesAPI:
         sortable.sort(key=lambda item: item[0])
         return [item[1] for item in sortable]
 
-    async def _ensure_data(self, *, force_refresh: bool = False) -> None:
-        """Refresh cached data when stale."""
-        if not force_refresh and self._data_fresh:
+    async def _ensure_data(self, *, force_refresh: bool = False, max_age: float | None = None) -> None:
+        """Refresh cached data when older than ``max_age`` seconds (default: cache_seconds)."""
+        if max_age is None:
+            max_age = self._cache_seconds
+        if not force_refresh and self._data_fresh(max_age):
             return
         async with self._lock:
-            if not force_refresh and self._data_fresh:
+            # Another caller sharing this client may have refreshed while we waited.
+            if not force_refresh and self._data_fresh(max_age):
                 return
             await self._refresh()
 
-    @property
-    def _data_fresh(self) -> bool:
-        if self._last_refresh is None:
-            return False
-        return (datetime.now(UTC) - self._last_refresh).total_seconds() < self._cache_seconds
+    def _data_fresh(self, max_age: float) -> bool:
+        age = self.data_age_seconds
+        return age is not None and age < max_age
 
     async def _refresh(self) -> None:
-        is_incremental = bool(self._last_refresh and self._station_index)
+        refresh_started_at = datetime.now(UTC)
+        full_resync_due = (
+            self._last_full_refresh is None
+            or (refresh_started_at - self._last_full_refresh).total_seconds() >= FULL_RESYNC_SECONDS
+        )
+        is_incremental = bool(self._updates_since and self._station_index and not full_resync_due)
         # Fuel Finder's incremental endpoints expect "YYYY-MM-DD HH:MM:SS"
         # (matching the API docs' request example), not a bare date - a
         # date-only value is silently rejected with an undocumented 404
         # instead of the documented 400, forcing a full-snapshot fallback
         # on every refresh.
-        incremental_timestamp = self._last_refresh.strftime("%Y-%m-%d %H:%M:%S") if self._last_refresh else None
+        incremental_timestamp = self._updates_since.strftime("%Y-%m-%d %H:%M:%S") if self._updates_since else None
+        was_full_snapshot = not is_incremental
 
         try:
             if is_incremental and incremental_timestamp:
@@ -225,29 +299,31 @@ class FuelPricesAPI:
                 prices = await self._fetch_station_prices(effective_start=incremental_timestamp)
                 if not stations and not prices:
                     _LOGGER.debug("Fuel Finder incremental refresh reported no station or price updates")
-                    self._last_refresh = datetime.now(UTC)
+                    self._mark_refreshed(refresh_started_at, full_snapshot=False)
                     return
                 self._merge_station_info(stations)
                 self._merge_station_prices(prices)
             else:
-                stations = await self._fetch_station_info()
-                await self._inter_fetch_pause()
-                prices = await self._fetch_station_prices()
-                new_index: dict[str, dict[str, Any]] = {}
-                self._station_index = new_index
-                self._merge_station_info(stations)
-                self._merge_station_prices(prices)
+                if self._station_index:
+                    _LOGGER.debug("Fuel Finder daily full resync (drops stations that have closed)")
+                await self._replace_with_full_snapshot()
         except RuntimeError as err:
+            if is_incremental and _is_transient_error(err):
+                # A 5xx/timeout/rate limit says nothing about our cached data,
+                # and a full snapshot is the request most likely to fail the
+                # same way (issue #14). Keep the cache and retry next cycle.
+                _LOGGER.warning(
+                    "Fuel Finder incremental refresh failed (%s); keeping cached data and retrying next cycle",
+                    err,
+                )
+                raise
             if is_incremental:
                 _LOGGER.warning(
                     "Fuel Finder incremental refresh failed (%s); retrying with full snapshot",
                     err,
                 )
-                stations = await self._fetch_station_info()
-                prices = await self._fetch_station_prices()
-                self._station_index = {}
-                self._merge_station_info(stations)
-                self._merge_station_prices(prices)
+                await self._replace_with_full_snapshot()
+                was_full_snapshot = True
             else:
                 raise
 
@@ -266,7 +342,22 @@ class FuelPricesAPI:
             raise RuntimeError("Fuel Finder response had no stations with usable coordinates")
 
         self._stations = station_records
+        self._mark_refreshed(refresh_started_at, full_snapshot=was_full_snapshot)
+
+    async def _replace_with_full_snapshot(self) -> None:
+        """Fetch every station and price, replacing the cache only once both succeed."""
+        stations = await self._fetch_station_info()
+        await self._inter_fetch_pause()
+        prices = await self._fetch_station_prices()
+        self._station_index = {}
+        self._merge_station_info(stations)
+        self._merge_station_prices(prices)
+
+    def _mark_refreshed(self, started_at: datetime, *, full_snapshot: bool) -> None:
         self._last_refresh = datetime.now(UTC)
+        self._updates_since = started_at - timedelta(seconds=INCREMENTAL_OVERLAP_SECONDS)
+        if full_snapshot:
+            self._last_full_refresh = started_at
 
     async def _fetch_station_info(self, *, effective_start: str | None = None) -> list[dict[str, Any]]:
         return await self._fetch_batched_resource(PFS_INFO_ENDPOINT, effective_start=effective_start)
@@ -365,7 +456,7 @@ class FuelPricesAPI:
         response_payload: Any = {}
 
         for attempt in (1, 2):
-            token = await self._get_access_token(force_refresh=(attempt == 2))
+            token = await self._get_access_token()
             headers = {
                 **DEFAULT_HEADERS,
                 "Authorization": f"Bearer {token}",
@@ -384,18 +475,13 @@ class FuelPricesAPI:
                             response_payload = await _parse_json_response(response)
                             if response.status in (401, 403) and attempt == 1:
                                 _LOGGER.info("Fuel Finder token rejected, refreshing OAuth token and retrying")
-                                # Invalidate shared token cache so other instances
-                                # don't reuse a rejected token.
-                                cache_key = (self._client_id, self._base_url)
-                                _global_token_cache.pop(cache_key, None)
-                                self._access_token = None
-                                self._token_expiry = None
+                                self._invalidate_token(token)
                                 token_rejected = True
                                 break
 
                             if response.status == 429:
                                 if retry_count >= MAX_429_RETRIES:
-                                    raise RuntimeError(
+                                    raise TransientApiError(
                                         f"GET {endpoint} failed (429): rate limit exceeded after retries"
                                     )
                                 backoff_seconds = _extract_retry_after_seconds(response)
@@ -422,7 +508,7 @@ class FuelPricesAPI:
                     _LOGGER.debug("Fuel Finder request cancelled: endpoint=%s params=%s", endpoint, params)
                     raise
                 except (TimeoutError, ClientError) as err:
-                    raise RuntimeError(f"GET {endpoint} failed: {err}") from err
+                    raise TransientApiError(f"GET {endpoint} failed: {err}") from err
 
                 if backoff_seconds is not None:
                     try:
@@ -494,31 +580,44 @@ class FuelPricesAPI:
         except asyncio.CancelledError:
             raise
 
-    async def _get_access_token(self, *, force_refresh: bool = False) -> str:
+    @property
+    def _token_cache_key(self) -> tuple[str, str, str]:
+        return (self._client_id, self._client_secret, self._base_url)
+
+    def _cached_token(self) -> str | None:
+        """Return the shared cached token for these credentials if still valid."""
+        cached = _global_token_cache.get(self._token_cache_key)
+        if cached and datetime.now(UTC) < cached[1]:
+            return cached[0]
+        return None
+
+    def _invalidate_token(self, rejected_token: str) -> None:
+        """Drop the shared token, but only if it is the one that was rejected.
+
+        If another instance has already replaced it with a fresh token, that
+        new token must be kept - discarding it would make us request yet
+        another token and invalidate theirs (the issue #8 ping-pong).
+        """
+        cached = _global_token_cache.get(self._token_cache_key)
+        if cached and cached[0] == rejected_token:
+            _global_token_cache.pop(self._token_cache_key, None)
+
+    async def _get_access_token(self) -> str:
         if not self._client_id or not self._client_secret:
             raise RuntimeError("Fuel Finder API credentials are missing")
 
-        cache_key = (self._client_id, self._base_url)
+        # Always read the shared cache: there is deliberately no per-instance
+        # copy, so a token refreshed by any instance is picked up by all.
+        token = self._cached_token()
+        if token:
+            return token
 
-        # Fast path: check instance-local token first (avoids lock contention)
-        if not force_refresh and self._token_is_valid:
-            return self._access_token or ""
-
-        # Slow path: acquire global token lock to deduplicate across instances
         async with _global_token_lock:
-            # Re-check instance-local token after acquiring lock
-            if not force_refresh and self._token_is_valid:
-                return self._access_token or ""
-
-            # Check shared cache — another instance may have just obtained a token
-            cached = _global_token_cache.get(cache_key)
-            if cached and not force_refresh:
-                cached_token, cached_expiry = cached
-                if datetime.now(UTC) < cached_expiry:
-                    self._access_token = cached_token
-                    self._token_expiry = cached_expiry
-                    _LOGGER.debug("Fuel Finder reusing cached token (expires %s)", cached_expiry.isoformat())
-                    return cached_token
+            # Another instance may have obtained a token while we waited.
+            token = self._cached_token()
+            if token:
+                _LOGGER.debug("Fuel Finder reusing token obtained by another instance")
+                return token
 
             timeout = ClientTimeout(total=DEFAULT_TIMEOUT_SECONDS)
             headers = {**DEFAULT_HEADERS, "Content-Type": "application/json", "Accept": "application/json"}
@@ -547,7 +646,7 @@ class FuelPricesAPI:
                                 )
                                 await self._set_global_429_cooldown(backoff)
                                 if token_retry >= MAX_429_RETRIES:
-                                    raise RuntimeError(
+                                    raise TransientApiError(
                                         "Fuel Finder token request failed (429): rate limit exceeded after retries"
                                     )
                                 _LOGGER.warning(
@@ -559,12 +658,13 @@ class FuelPricesAPI:
                                 token_backoff = backoff
                             elif response.status >= 400:
                                 message = _extract_api_error(response_payload) or response.reason
-                                raise RuntimeError(f"Fuel Finder token request failed ({response.status}): {message}")
+                                error_cls = TransientApiError if response.status >= 500 else RuntimeError
+                                raise error_cls(f"Fuel Finder token request failed ({response.status}): {message}")
                 except asyncio.CancelledError:
                     _LOGGER.debug("Fuel Finder token request cancelled")
                     raise
                 except (TimeoutError, ClientError) as err:
-                    raise RuntimeError(f"Fuel Finder token request failed: {err}") from err
+                    raise TransientApiError(f"Fuel Finder token request failed: {err}") from err
 
                 if token_backoff is not None:
                     try:
@@ -591,19 +691,11 @@ class FuelPricesAPI:
             except (TypeError, ValueError):
                 expiry_seconds = 3600
 
-            self._access_token = token
-            self._token_expiry = datetime.now(UTC) + timedelta(seconds=expiry_seconds - 60)
-
-            # Store in shared cache so other instances with the same credentials
-            # can reuse this token without hitting the endpoint again.
-            _global_token_cache[cache_key] = (token, self._token_expiry)
-            _LOGGER.debug("Fuel Finder token obtained and cached (expires %s)", self._token_expiry.isoformat())
+            token_expiry = datetime.now(UTC) + timedelta(seconds=expiry_seconds - 60)
+            _global_token_cache[self._token_cache_key] = (token, token_expiry)
+            _LOGGER.debug("Fuel Finder token obtained and cached (expires %s)", token_expiry.isoformat())
 
             return token
-
-    @property
-    def _token_is_valid(self) -> bool:
-        return bool(self._access_token and self._token_expiry and datetime.now(UTC) < self._token_expiry)
 
     def _merge_station_info(self, rows: list[dict[str, Any]]) -> None:
         for row in rows:
@@ -675,7 +767,11 @@ class FuelPricesAPI:
                 }
 
             station_prices = station.get("prices")
-            prices: dict[str, Any] = station_prices if isinstance(station_prices, dict) else {}
+            # Build a new dict rather than mutating the cached one in place: the
+            # coordinator's previous data shares these dicts (stations are only
+            # shallow-copied), so in-place edits would make old and new data
+            # compare equal and could suppress the sensor update.
+            prices: dict[str, Any] = dict(station_prices) if isinstance(station_prices, dict) else {}
             last_updated = station.get("last_updated") if isinstance(station.get("last_updated"), str) else None
 
             for fuel_entry in _extract_fuel_entries_from_row(row):
@@ -689,6 +785,17 @@ class FuelPricesAPI:
 
                 parsed_price = _extract_fuel_entry_price(fuel_entry)
                 if parsed_price is None:
+                    continue
+                if not is_plausible_price(parsed_price):
+                    # A junk value (0, a typo, a mis-scaled unit) would otherwise
+                    # rank as the cheapest price and, with long-term statistics,
+                    # leave a permanent spike. Keep the previous price instead.
+                    _LOGGER.debug(
+                        "Ignoring implausible %s price %s for station %s",
+                        target_fuel_type,
+                        parsed_price,
+                        node_id,
+                    )
                     continue
 
                 price_last_updated = _parse_datetime(

@@ -14,5 +14,6 @@ requests>=2.31.0
 # Test-only dependencies.
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
-aioresponses>=0.7.6
+# Pre-1.0, so capped at the minor version the tests were written against.
+aiointercept>=0.1.12,<0.2
 ruff>=0.6.0

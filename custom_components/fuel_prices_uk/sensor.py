@@ -6,7 +6,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_ATTRIBUTION
 from homeassistant.core import callback
@@ -205,7 +205,8 @@ class CheapestFuelPriceSensor(CoordinatorEntity, SensorEntity):  # type: ignore[
             self._attr_unique_id = f"{entry.entry_id}_{fuel_type}_cheapest_{self._price_rank}"
             self._attr_name = f"{ENTRY_TITLE} ({location_label}) - {self._rank_label} Cheapest {fuel_type}"
         self._location_label = location_label
-        self._attr_device_class = SensorDeviceClass.MONETARY
+        # MEASUREMENT enables long-term statistics; HA disallows it with the MONETARY device class.
+        self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_native_unit_of_measurement = "GBP"
         self._attr_suggested_display_precision = 3
         self._attr_icon = "mdi:gas-station"

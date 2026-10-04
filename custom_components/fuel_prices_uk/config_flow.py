@@ -868,9 +868,10 @@ class OptionsFlowHandler(OptionsFlowWithConfigEntry):
                 updated_data[CONF_NEAREST_COUNT] = nearest_count
                 updated_data[CONF_MAX_DATA_AGE_DAYS] = user_input.get(CONF_MAX_DATA_AGE_DAYS, DEFAULT_MAX_DATA_AGE_DAYS)
 
-                # Remove address if it was set before
-                if CONF_ADDRESS in updated_data:
-                    del updated_data[CONF_ADDRESS]
+                # Blank (not delete) the address: options are merged over
+                # entry.data, so a missing key would let the original address
+                # from entry.data show through in entity names.
+                updated_data[CONF_ADDRESS] = ""
 
                 return self.async_create_entry(title="", data=updated_data)
 
@@ -1090,8 +1091,8 @@ class OptionsFlowHandler(OptionsFlowWithConfigEntry):
                 updated_data[CONF_CHEAPEST_COUNT] = cheapest_count
                 updated_data[CONF_NEAREST_COUNT] = nearest_count
                 updated_data[CONF_MAX_DATA_AGE_DAYS] = user_input.get(CONF_MAX_DATA_AGE_DAYS, DEFAULT_MAX_DATA_AGE_DAYS)
-                if CONF_ADDRESS in updated_data:
-                    del updated_data[CONF_ADDRESS]
+                # See location_map: blank rather than delete so it overrides entry.data.
+                updated_data[CONF_ADDRESS] = ""
                 return self.async_create_entry(title="", data=updated_data)
 
         current_tracker = merged.get(CONF_DEVICE_TRACKER, "")
