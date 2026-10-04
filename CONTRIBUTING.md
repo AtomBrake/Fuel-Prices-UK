@@ -29,10 +29,15 @@ credentials or network access required. It covers:
 - `FuelPricesAPI`'s refresh/pagination/incremental-fallback logic against a
   mocked Fuel Finder API, including rate-limit backoff and token caching
 - the stale-data Repair's failure-counting logic
+- the coordinator's location resolution, shared API client and
+  cached-data fallback, and config entry setup/unload
+- sensor ranking, stale-price filtering, attributes and naming
+- the options flow's location-method steps
 
-`config_flow.py` and `sensor.py`'s Home Assistant UI wiring are not covered
-by automated tests currently — verify config flow and sensor changes
-manually against a running Home Assistant instance.
+These run against mocked `hass` objects rather than a real Home Assistant
+instance, so the initial config flow, entity registration and UI rendering
+are not covered — verify config flow and sensor changes manually against a
+running Home Assistant instance.
 
 ## Linting
 

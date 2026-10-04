@@ -13,6 +13,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import slugify
 
+from . import FuelPricesDataUpdateCoordinator
 from .const import (
     ATTR_ADDRESS,
     ATTR_BRAND,
@@ -105,7 +106,13 @@ def _parse_last_updated(value: str | None) -> datetime | None:
             return dt
         except ValueError:
             continue
-    return None
+    # The API client stores ISO timestamps, which carry fractional seconds
+    # whenever the feed's do; none of the formats above accept those.
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 def _radius_to_miles(radius_km: Any) -> float:
@@ -185,7 +192,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
         raise
 
 
-class CheapestFuelPriceSensor(CoordinatorEntity, SensorEntity):  # type: ignore[misc]
+class CheapestFuelPriceSensor(CoordinatorEntity[FuelPricesDataUpdateCoordinator], SensorEntity):  # type: ignore[misc]
     """Representation of a Cheapest Fuel Price Sensor."""
 
     def __init__(self, coordinator, entry: ConfigEntry, fuel_type: str, price_rank: int = 1) -> None:

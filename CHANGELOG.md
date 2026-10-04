@@ -35,15 +35,21 @@ All notable changes to this project are documented here. Format follows
 - Closed stations are now removed: the cache is fully resynced once a day,
   because incremental updates never report removed stations. Previously a
   closed station kept its last price, possibly as the "cheapest", until
-  Home Assistant restarted.
+  Home Assistant restarted. If the resync fails, prices keep updating
+  incrementally and the resync is retried on the next poll.
 - Implausible prices (outside GBP 0.50–5.00 per litre, for example a `0` in
   the feed) are ignored instead of becoming the cheapest price, and the
   station's previous price is kept.
 - Each incremental refresh window now starts 5 minutes before the previous
   fetch began, not when it finished, so prices published while a fetch was
   in progress are no longer missed.
-- Switching an entry from address to map or device tracker in the options
-  no longer leaves the old address in entity names.
+- Switching an entry from an address to a map location in the options no
+  longer leaves the old address in entity names. (After switching to a
+  device tracker, names still use the entry's title, which for an entry
+  first set up from an address includes that address.)
+- The `max_data_age_days` filter now also applies to prices whose
+  timestamps include fractional seconds. Previously those prices were never
+  treated as stale.
 - Saving options no longer adds another 15 seconds to the next startup
   refresh each time. The per-entry startup stagger has been removed:
   entries now share one API client, and requests were already serialised.
@@ -62,6 +68,9 @@ All notable changes to this project are documented here. Format follows
   Home Assistant uses). CI now tests on Python 3.14 only, which current
   Home Assistant requires; the newest Home Assistant installable on older
   Pythons pins dependency versions aiointercept doesn't support.
+- The test suite now also covers the sensors (ranking, stale filtering,
+  attributes, statistics settings), the options flow's location steps and
+  config entry setup/unload.
 - `requests` is no longer listed in `manifest.json` requirements. Home
   Assistant already ships it, and hassfest now rejects custom integrations
   that list it.

@@ -301,6 +301,42 @@ class TestIncrementalRefresh:
 
             assert all("effective-start-timestamp" in str(url) for (method, url) in m.requests if method == "GET")
 
+    async def test_incremental_429_after_retries_is_transient(self, fast_client, aiohttp_client_session) -> None:
+        """Exhausted rate-limit retries must not trigger the heavier full-snapshot fallback."""
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c6d", client_secret="s6d")
+        async with _mock_api() as m:
+            await _full_snapshot_refresh(api, m)
+
+        async with _mock_api() as m:
+            _mock_token(m)
+            for _ in range(fast_client.MAX_429_RETRIES + 1):
+                m.get(PFS_INFO_PATTERN, status=429)
+
+            with pytest.raises(TransientApiError):
+                await api._refresh()
+
+            assert all("effective-start-timestamp" in str(url) for (method, url) in m.requests if method == "GET")
+        assert api._station_index["s1"]["prices"]["E10"]["price"] == pytest.approx(1.459)
+
+    async def test_token_endpoint_5xx_is_transient(self, fast_client, aiohttp_client_session) -> None:
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c6e", client_secret="s6e")
+        async with _mock_api() as m:
+            m.post(TOKEN_URL, status=503, payload={"message": "Service Unavailable"})
+
+            with pytest.raises(TransientApiError):
+                await api._get_access_token()
+
+    async def test_token_endpoint_4xx_is_not_transient(self, fast_client, aiohttp_client_session) -> None:
+        """Bad credentials are a configuration problem, not something to ride out."""
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c6f", client_secret="s6f")
+        async with _mock_api() as m:
+            m.post(TOKEN_URL, status=401, payload={"message": "invalid client"})
+
+            with pytest.raises(RuntimeError) as excinfo:
+                await api._get_access_token()
+
+        assert not isinstance(excinfo.value, TransientApiError)
+
 
 class TestCacheFreshness:
     """The cache lifetime must follow the caller's poll interval, not a fixed hour."""
@@ -309,6 +345,7 @@ class TestCacheFreshness:
         api = FuelPricesAPI(session=aiohttp_client_session, client_id="c10", client_secret="s10")
         async with _mock_api() as m:
             await _full_snapshot_refresh(api, m)
+        assert api._last_refresh is not None
         api._last_refresh -= timedelta(seconds=900)
 
         async with _mock_api() as m:
@@ -348,6 +385,7 @@ class TestCacheFreshness:
         assert cached[0]["site_id"] == "s1"
         assert cached[0]["distance"] == 0
 
+        assert api._last_refresh is not None
         api._last_refresh -= timedelta(hours=2)
         assert api.cached_stations_within_radius(51.5, -0.12, 5, max_age=3600) is None
 
@@ -489,7 +527,7 @@ class TestRefreshWindowsAndResync:
         after_fetch = datetime.now(UTC)
 
         # Anchored to when the fetch started (minus the overlap), not when it finished.
-        assert api._updates_since is not None
+        assert api._updates_since is not None and api._last_refresh is not None
         assert before_fetch - overlap <= api._updates_since <= after_fetch - overlap
         assert api._updates_since < api._last_refresh - overlap
 
@@ -520,6 +558,7 @@ class TestRefreshWindowsAndResync:
         assert set(api._station_index) == {"open", "closed"}
 
         # A day later the closed station is simply absent from the snapshot.
+        assert api._last_full_refresh is not None
         api._last_full_refresh -= timedelta(seconds=fast_client.FULL_RESYNC_SECONDS + 1)
         async with _mock_api() as m:
             _mock_token(m)
@@ -531,19 +570,66 @@ class TestRefreshWindowsAndResync:
 
         assert set(api._station_index) == {"open"}
 
-    async def test_failed_resync_keeps_existing_cache(self, fast_client, aiohttp_client_session) -> None:
+    async def test_failed_resync_falls_back_to_incremental_update(self, fast_client, aiohttp_client_session) -> None:
+        """A failed daily resync must not freeze prices until a full snapshot gets through.
+
+        Full snapshots are the request most prone to failing upstream (issue
+        #14), so the cache keeps receiving incremental updates and the resync
+        is retried on the next cycle.
+        """
         api = FuelPricesAPI(session=aiohttp_client_session, client_id="c22", client_secret="s22")
         async with _mock_api() as m:
             await _full_snapshot_refresh(api, m)
+        assert api._last_full_refresh is not None
         api._last_full_refresh -= timedelta(seconds=fast_client.FULL_RESYNC_SECONDS + 1)
+        last_full_refresh = api._last_full_refresh
 
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(PFS_INFO_PATTERN, status=500, payload={"message": "Internal Server Error"})  # full resync
+            m.get(PFS_INFO_PATTERN, status=404, payload={"message": "Requested batch 1 is not available"})
+            m.get(PFS_PRICES_PATTERN, status=200, payload={"total_batches": 1, "data": [_price_row("s1", 139.9)]})
+            await api._refresh()
+
+            assert len(_incremental_starts(m)) == 2
+
+        assert api._station_index["s1"]["prices"]["E10"]["price"] == pytest.approx(1.399)
+        assert api.data_age_seconds is not None and api.data_age_seconds < 5
+        # Still due, so the next refresh tries the resync again.
+        assert api._last_full_refresh == last_full_refresh
+
+    async def test_failed_resync_and_incremental_keeps_existing_cache(
+        self, fast_client, aiohttp_client_session
+    ) -> None:
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c22b", client_secret="s22b")
+        async with _mock_api() as m:
+            await _full_snapshot_refresh(api, m)
+        assert api._last_full_refresh is not None
+        api._last_full_refresh -= timedelta(seconds=fast_client.FULL_RESYNC_SECONDS + 1)
+        refreshed_at = api._last_refresh
+
+        async with _mock_api() as m:
+            _mock_token(m)
+            m.get(PFS_INFO_PATTERN, status=500, payload={"message": "Internal Server Error"})  # full resync
+            m.get(PFS_INFO_PATTERN, status=500, payload={"message": "Internal Server Error"})  # incremental
+            with pytest.raises(ApiHttpError):
+                await api._refresh()
+
+        assert api._last_refresh == refreshed_at
+        assert api._station_index["s1"]["prices"]["E10"]["price"] == pytest.approx(1.459)
+
+    async def test_failed_first_snapshot_still_raises(self, fast_client, aiohttp_client_session) -> None:
+        """With no cache yet there is nothing to update incrementally."""
+        api = FuelPricesAPI(session=aiohttp_client_session, client_id="c22c", client_secret="s22c")
         async with _mock_api() as m:
             _mock_token(m)
             m.get(PFS_INFO_PATTERN, status=500, payload={"message": "Internal Server Error"})
             with pytest.raises(ApiHttpError):
                 await api._refresh()
 
-        assert api._station_index["s1"]["prices"]["E10"]["price"] == pytest.approx(1.459)
+            assert _incremental_starts(m) == []
+
+        assert api._last_refresh is None
 
 
 class TestPriceSanity:

@@ -283,7 +283,8 @@ class FuelPricesAPI:
             self._last_full_refresh is None
             or (refresh_started_at - self._last_full_refresh).total_seconds() >= FULL_RESYNC_SECONDS
         )
-        is_incremental = bool(self._updates_since and self._station_index and not full_resync_due)
+        can_refresh_incrementally = bool(self._updates_since and self._station_index)
+        is_incremental = can_refresh_incrementally and not full_resync_due
         # Fuel Finder's incremental endpoints expect "YYYY-MM-DD HH:MM:SS"
         # (matching the API docs' request example), not a bare date - a
         # date-only value is silently rejected with an undocumented 404
@@ -294,15 +295,10 @@ class FuelPricesAPI:
 
         try:
             if is_incremental and incremental_timestamp:
-                stations = await self._fetch_station_info(effective_start=incremental_timestamp)
-                await self._inter_fetch_pause()
-                prices = await self._fetch_station_prices(effective_start=incremental_timestamp)
-                if not stations and not prices:
+                if not await self._apply_incremental_updates(incremental_timestamp):
                     _LOGGER.debug("Fuel Finder incremental refresh reported no station or price updates")
                     self._mark_refreshed(refresh_started_at, full_snapshot=False)
                     return
-                self._merge_station_info(stations)
-                self._merge_station_prices(prices)
             else:
                 if self._station_index:
                     _LOGGER.debug("Fuel Finder daily full resync (drops stations that have closed)")
@@ -324,6 +320,19 @@ class FuelPricesAPI:
                 )
                 await self._replace_with_full_snapshot()
                 was_full_snapshot = True
+            elif can_refresh_incrementally and incremental_timestamp:
+                # The daily resync failed, but the cache is still usable. Full
+                # snapshots are the request most prone to failing upstream
+                # (issue #14), so keep prices current with an incremental update
+                # and retry the resync next cycle rather than freezing prices
+                # until a full snapshot gets through.
+                _LOGGER.warning(
+                    "Fuel Finder daily full resync failed (%s); applying incremental updates instead "
+                    "and retrying the resync next cycle",
+                    err,
+                )
+                await self._apply_incremental_updates(incremental_timestamp)
+                was_full_snapshot = False
             else:
                 raise
 
@@ -343,6 +352,17 @@ class FuelPricesAPI:
 
         self._stations = station_records
         self._mark_refreshed(refresh_started_at, full_snapshot=was_full_snapshot)
+
+    async def _apply_incremental_updates(self, effective_start: str) -> bool:
+        """Merge station and price changes since ``effective_start``; return False if there were none."""
+        stations = await self._fetch_station_info(effective_start=effective_start)
+        await self._inter_fetch_pause()
+        prices = await self._fetch_station_prices(effective_start=effective_start)
+        if not stations and not prices:
+            return False
+        self._merge_station_info(stations)
+        self._merge_station_prices(prices)
+        return True
 
     async def _replace_with_full_snapshot(self) -> None:
         """Fetch every station and price, replacing the cache only once both succeed."""

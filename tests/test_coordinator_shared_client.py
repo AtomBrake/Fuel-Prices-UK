@@ -6,7 +6,6 @@ instances (bypassing DataUpdateCoordinator.__init__) with hass mocked out.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,8 +15,10 @@ import custom_components.fuel_prices_uk as integration
 from custom_components.fuel_prices_uk.const import CACHE_REFRESH_MARGIN_SECONDS, CACHED_DATA_GRACE_SECONDS, DOMAIN
 
 
-def _fake_hass() -> SimpleNamespace:
-    return SimpleNamespace(data={DOMAIN: {}})
+def _fake_hass() -> MagicMock:
+    hass = MagicMock()
+    hass.data = {DOMAIN: {}}
+    return hass
 
 
 class TestSharedApiClient:
